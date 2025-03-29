@@ -9,9 +9,10 @@ if [ $# -lt 1 ]; then
 fi
 
 # Create temporary directory
+cleanup_needed=true
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
-# trap 'export tmpdir; open $tmpdir' EXIT
+# Set conditional trap
+trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
 # Initialize arrays
 declare -a input_files=("$@")
@@ -66,42 +67,49 @@ cumulative_offset=0
 chapters_file="$tmpdir/chapters.txt"
 
 # Process each input file
-# NOTE: I am assuming the first file has the correct values and ignoring the rest except chapter info
-for i in "${!input_files[@]}"; do
-  file="${input_files[$i]}"
-  absolute_path=$(realpath "$file")
-  echo "Processing $file..."
+process_input_files() {
+  # NOTE: I am assuming the first file has the correct values and ignoring the rest except chapter info
+  for i in "${!input_files[@]}"; do
+    file="${input_files[$i]}"
+    absolute_path=$(realpath "$file")
+    echo "Processing $file..."
 
-  # Create file list (with proper quoting)
-  list_file="$tmpdir/list.txt"
-  echo "file '$absolute_path'" >>"$list_file"
+    # Create file list (with proper quoting)
+    list_file="$tmpdir/list.txt"
+    echo "file '$absolute_path'" >>"$list_file"
 
-  # Extract metadata
-  meta_file="$tmpdir/meta$i.json"
-  ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
-  meta_files+=("$meta_file")
+    # Extract metadata
+    meta_file="$tmpdir/meta$i.json"
+    ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
+    meta_files+=("$meta_file")
 
-  # Get cover image
-  # WARN: assuming jpg for convenience
-  cover_image="$tmpdir/cover_$i.jpg"
-  if extract_cover "$file" "$cover_image"; then
-    cover_images+=("$cover_image")
-  fi
+    # Get cover image
+    # WARN: assuming jpg for convenience
+    cover_image="$tmpdir/cover_$i.jpg"
+    if extract_cover "$file" "$cover_image"; then
+      cover_images+=("$cover_image")
+    fi
+    # Get original file duration in seconds (floating-point) for precision in file comparison
+    duration=$(jq -r '.format.duration' "$meta_file")
 
-  # Get file duration in milliseconds
-  duration=$(jq -r '.format.duration' "$meta_file")
-  duration_ms=$(echo "$duration * 1000" | bc | cut -d. -f1)
+    # For integer milliseconds (rounded):
+    rounded_ms=$(sec2msInt $duration)
+    echo "Rounded milliseconds: $rounded_ms" # Output: 381457
+    # duration_ms=$(printf "%.of" $(echo "scale=3; $duration * 1000" | bc))
+    # echo "Rounded duration is $duration_ms"
 
-  # process_chapters
-  # generate_chapter_ffmetadata "$meta_file" "$cumulative_offset" "$chapters_file"
-  result=$(process_chapter_offset "$meta_file" "$cumulative_offset")
-  printf "%s" "$result" >>"$chapters_file"
+    # process_chapters
+    # generate_chapter_ffmetadata "$meta_file" "$cumulative_offset" "$chapters_file"
+    result=$(process_chapter_offset "$meta_file" "$cumulative_offset")
+    printf "%s" "$result" >>"$chapters_file"
 
-  # set offset to running total of duration_ms.  Duration array should calculate as equal
-  cumulative_offset=$((cumulative_offset + duration_ms))
-  durations+=("$duration_ms")
+    # set seach file offset to running total of duration_ms as integer.
+    cumulative_offset=$((cumulative_offset + rounded_ms))
 
-done
+    # Keep total in seconds with full precision and compare later as milliseconds
+    durations+=("$duration")
+  done
+}
 
 get_required_tags() {
   set -e
@@ -162,10 +170,21 @@ merge_audiobooks() {
   eval $ffmpeg_cmd
 }
 
+sec2msInt() {
+  local seconds=$1
+  # convert seconds to rounded MS integers
+  total_ms=$(echo "scale=3; $seconds * 1000" | bc)
+
+  # For integer milliseconds (rounded):
+  rounded_ms=$(printf "%.0f" "$total_ms")
+  echo "$rounded_ms"
+}
+
 get_file_duration_in_ms() {
   local meta_file="$1"
   duration=$(ffprobe -v quiet -i "$meta_file" -show_format -of json | jq -r '.format.duration')
-  duration_ms=$(echo "$duration * 1000" | bc | cut -d. -f1)
+  # duration_ms=$(echo "$duration * 1000" | bc | cut -d. -f1)
+  duration_ms=$(sec2msInt $duration)
   echo "$duration_ms"
 }
 
@@ -176,19 +195,29 @@ verify_merged_file() {
   merged_duration=$(get_file_duration_in_ms "$tmpdir/merged.m4a")
   echo "Merged file duration is: $merged_duration"
   expected_duration=0
-  for duration in "${durations[@]}"; do
-    expected_duration=$((expected_duration + duration))
-  done
-  echo "Expected duration was: $expected_duration"
 
-  if [ "$merged_duration" -eq "$expected_duration" ]; then
+  # Sum durations using bc (scale=6 for 6 decimal places)
+  sum_seconds=$(
+    IFS=+
+    echo "scale=6; ${durations[*]}" | bc
+  )
+  echo "Total seconds: $sum_seconds" # Output: 381.457415
+
+  expected_duration_ms=$(sec2msInt $sum_seconds)
+  echo "Expected duration was: $expected_duration_ms"
+
+  if [ "$merged_duration" -eq "$expected_duration_ms" ]; then
     echo "Duration verification passed"
   else
     echo "Warning: Merged file duration ($merged_duration ms) does not match sum of input durations ($expected_duration ms)"
-    exit 1
+    # If failure occurs:
+    open "$tmpdir"
+    cleanup_needed=false
+    return 1
   fi
 }
 
+process_input_files
 create_combined_metafile
 merge_audiobooks
 # add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
