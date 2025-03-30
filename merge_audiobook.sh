@@ -22,7 +22,7 @@ declare -a meta_files
 declare -a cover_images
 
 process_chapter_info() {
-  # Given a list of chapters in json and an offset in milliseconds
+  # Given a chapters in json and an offset in milliseconds
   # generate the new ffmetadata chapter information with new offset
   local meta_file="$1"
   local offset="$2"
@@ -36,6 +36,18 @@ process_chapter_info() {
         "END=\(.end + $offset)\n" +
         "title=\(.tags.title // "Untitled")\n"
     ' "$meta_file")
+
+  if [ -z $chapter_data ]; then
+    echo "No chapter found, using filename as chapter"
+    chapter_data=$(jq -r --argjson offset "$offset" '
+        .format |
+        "[CHAPTER]\n" +
+        "TIMEBASE=1/1000\n" +
+        "START=\(.start + $offset)\n" +
+        "END=\(.end + $offset)\n" +
+        "title=\(.filename // "Untitled")\n"
+    ' "$meta_file")
+  fi
 
   printf "%s" "$chapter_data"
 }
@@ -77,25 +89,22 @@ process_input_files() {
     # Create file list (with proper quoting)
     list_file="$tmpdir/list.txt"
 
-    # Populate ffmpeg file list
-    # absolute_path="/path/to/file/Author's Notes (Final).m4a"
-    printf "file '%s'\n" "${absolute_path}" >>"$list_file"
-    # NOTE: Works but doesn't escape single quoets in file path
-    # file '/path/to/file/Author's Notes (Final).m4a'
+    generate_ffmpeg_file_list() {
+      # generate concat demuxer input file line
 
-    # This should hopefully escape the single quotes inside of $absolute_path
-    # but actually escapes all special charcters
-    # printf "file '%q' " "${absolute_path}" >>"$list_file"
-    # WARN: escapes all spcial charcters
-    # file '/path/to/file/Author\'s\ Notes\ \(Final\).m4a'
+      # NOTE: replace any single quotes with escaped single quotes
+      # absolute_path="/path/to/file/Author's Notes (Final).m4a"
+      ffmpeg_path=${absolute_path//\'/\'\\\'\'}
 
-    # printf "file '%s'\n" "${absolute_path//'/'\''}" >>"$list_file"
-    # WARN: does not create the escaped format cleanup_needed
-    # file '/path/to/file/Author\'\\'\'s Notes (Final).m4a'
-    # 'This is how you '\''escape'\'' a single quote'
+      # Okay trying with separate string and quoted string arguments
+      # TEST:
+      # printf "file '%s'\n" "${absolute_path//\'/\'\\\'\'}" >>"$list_file"
 
-    # printf "file '%q $absolute_path'" >>$list_file
+      ## NOTE: Going back to Echo with a pre-processed single quote escaped string variable
+      echo "file '${ffmpeg_path}'" >>"$list_file"
 
+    }
+    generate_ffmpeg_file_list
     # Extract metadata
     meta_file="$tmpdir/meta$i.json"
     ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
@@ -152,6 +161,7 @@ create_combined_metafile() {
   # Header and file creation
   echo ";FFMETADATA1" >"$combined_meta"
   # Global Metadata (year does not appear to be supported)
+  # NOTE: currently only parsing first file
   get_required_tags "$tmpdir/meta0.json" "artist" "album" "album_artist" >>"$combined_meta"
 
   # [Stream] Metadata placeholder
@@ -164,7 +174,6 @@ merge_audiobooks() {
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
 
-  set -x
   echo "Merging files..."
   # Use an array to store command components
   local ffmpeg_args=()
@@ -199,10 +208,10 @@ merge_audiobooks() {
 
 sec2msInt() {
   local seconds=$1
-  # convert seconds to rounded MS integers
+  # convert real number seconds to milliseconds
   total_ms=$(echo "scale=3; $seconds * 1000" | bc)
 
-  # For integer milliseconds (rounded):
+  # convert to integer milliseconds (rounded):
   rounded_ms=$(printf "%.0f" "$total_ms")
   echo "$rounded_ms"
 }
@@ -254,5 +263,6 @@ verify_merged_file
 final_output="$artist-$album.m4b"
 mv "$tmpdir/merged.m4a" "./$final_output"
 mv "$combined_meta" .
+mv "$chapters_file" .
 
 echo "Successfully created: $final_output"
