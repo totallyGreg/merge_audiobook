@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e # Exit on error
+set -euo pipefail
 
 # Check for input files
 # NOTE: this currently assumes m4a/b audiofiles
@@ -8,11 +8,12 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
-# Create temporary directory
+# Create safe temporary directory
+tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
 cleanup_needed=true
-tmpdir=$(mktemp -d)
+
 # Set conditional trap
-trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
+# trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
 # Initialize arrays
 declare -a input_files=("$@")
@@ -20,7 +21,7 @@ declare -a durations
 declare -a meta_files
 declare -a cover_images
 
-process_chapter_offset() {
+process_chapter_info() {
   # Given a list of chapters in json and an offset in milliseconds
   # generate the new ffmetadata chapter information with new offset
   local meta_file="$1"
@@ -39,8 +40,7 @@ process_chapter_offset() {
   printf "%s" "$chapter_data"
 }
 
-#
-extract_cover() {
+extract_cover_art() {
   local input_file="$1"
   local output_file="$2"
   ffmpeg -i "$input_file" -an -vcodec copy "$output_file" 2>/dev/null
@@ -68,7 +68,7 @@ chapters_file="$tmpdir/chapters.txt"
 
 # Process each input file
 process_input_files() {
-  # NOTE: I am assuming the first file has the correct values and ignoring the rest except chapter info
+  # NOTE: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
   for i in "${!input_files[@]}"; do
     file="${input_files[$i]}"
     absolute_path=$(realpath "$file")
@@ -76,7 +76,25 @@ process_input_files() {
 
     # Create file list (with proper quoting)
     list_file="$tmpdir/list.txt"
-    echo "file '$absolute_path'" >>"$list_file"
+
+    # Populate ffmpeg file list
+    # absolute_path="/path/to/file/Author's Notes (Final).m4a"
+    printf "file '%s'\n" "${absolute_path}" >>"$list_file"
+    # NOTE: Works but doesn't escape single quoets in file path
+    # file '/path/to/file/Author's Notes (Final).m4a'
+
+    # This should hopefully escape the single quotes inside of $absolute_path
+    # but actually escapes all special charcters
+    # printf "file '%q' " "${absolute_path}" >>"$list_file"
+    # WARN: escapes all spcial charcters
+    # file '/path/to/file/Author\'s\ Notes\ \(Final\).m4a'
+
+    # printf "file '%s'\n" "${absolute_path//'/'\''}" >>"$list_file"
+    # WARN: does not create the escaped format cleanup_needed
+    # file '/path/to/file/Author\'\\'\'s Notes (Final).m4a'
+    # 'This is how you '\''escape'\'' a single quote'
+
+    # printf "file '%q $absolute_path'" >>$list_file
 
     # Extract metadata
     meta_file="$tmpdir/meta$i.json"
@@ -86,7 +104,7 @@ process_input_files() {
     # Get cover image
     # WARN: assuming jpg for convenience
     cover_image="$tmpdir/cover_$i.jpg"
-    if extract_cover "$file" "$cover_image"; then
+    if extract_cover_art "$file" "$cover_image"; then
       cover_images+=("$cover_image")
     fi
     # Get original file duration in seconds (floating-point) for precision in file comparison
@@ -94,16 +112,13 @@ process_input_files() {
 
     # For integer milliseconds (rounded):
     rounded_ms=$(sec2msInt $duration)
-    echo "Rounded milliseconds: $rounded_ms" # Output: 381457
-    # duration_ms=$(printf "%.of" $(echo "scale=3; $duration * 1000" | bc))
-    # echo "Rounded duration is $duration_ms"
+    # echo "Rounded milliseconds: $rounded_ms"
 
     # process_chapters
-    # generate_chapter_ffmetadata "$meta_file" "$cumulative_offset" "$chapters_file"
-    result=$(process_chapter_offset "$meta_file" "$cumulative_offset")
+    result=$(process_chapter_info "$meta_file" "$cumulative_offset")
     printf "%s" "$result" >>"$chapters_file"
 
-    # set seach file offset to running total of duration_ms as integer.
+    # set each file offset to running total of duration_ms as integer.
     cumulative_offset=$((cumulative_offset + rounded_ms))
 
     # Keep total in seconds with full precision and compare later as milliseconds
@@ -132,7 +147,8 @@ get_required_tags() {
 }
 
 create_combined_metafile() {
-  combined_meta="$tmpdir/metafile.txt"
+  # combined_meta="$tmpdir/metafile.txt"
+  combined_meta=$(printf "%q" "$tmpdir/metadata.txt")
   # Header and file creation
   echo ";FFMETADATA1" >"$combined_meta"
   # Global Metadata (year does not appear to be supported)
@@ -147,27 +163,38 @@ merge_audiobooks() {
   # Merge files and apply metadata
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
-  #
-  # ffmpeg -loglevel error -hide_banner -f concat -safe 0 -i "$list_file" -i "$combined_meta" \
-  #   -map_metadata 1 -map_chapters 1 -map 0:a -attach "${cover_images[0]}" -metadata:s:t:0 mimetype=image/jpeg \
-  #   -movflags use_metadata_tags -c copy "$tmpdir/merged.m4a"
 
+  set -x
   echo "Merging files..."
-  ffmpeg_cmd="ffmpeg -loglevel error -hide_banner -f concat -safe 0 -i \"$list_file\" -i \"$combined_meta\""
+  # Use an array to store command components
+  local ffmpeg_args=()
+
+  # Add base command components
+  ffmpeg_args+=(
+    -loglevel error
+    -hide_banner
+    -f concat
+    -safe 0
+    -i "$list_file" # Escape special chars
+    -i "$(printf "%q" "$combined_meta")"
+  )
+
+  # Add mapping and encoding options
+  ffmpeg_args+=(
+    -map_metadata 1
+    -map_chapters 1
+    -map 0:a
+    -movflags use_metadata_tags
+    -c copy
+    "$(printf "%q" "$tmpdir/merged.m4a")" # Escape output path
+  )
 
   # for cover in "${cover_images[@]}"; do
-  #   ffmpeg_cmd+=" -i \"$cover\""
+  #   ffmpeg_args+=(-i "$cover" )
   # done
 
-  ffmpeg_cmd+=" -map_metadata 1 -map_chapters 1 -map 0:a"
-
-  # for i in "${!cover_images[@]}"; do
-  #   ffmpeg_cmd+=" -attach \"${cover_images[$i]}\" -metadata:s:t:$i mimetype=image/jpeg"
-  # done
-
-  ffmpeg_cmd+=" -movflags use_metadata_tags -c copy \"$tmpdir/merged.m4a\""
-
-  eval $ffmpeg_cmd
+  # Execute with proper quoting
+  ffmpeg "${ffmpeg_args[@]}"
 }
 
 sec2msInt() {
