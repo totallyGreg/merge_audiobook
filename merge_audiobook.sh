@@ -21,82 +21,39 @@ declare -a durations
 declare -a meta_files
 declare -a cover_images
 
+# NOTE: fairly well organized
 generate_chapter_info() {
-  set -x
-  # Given a chapters in json and an offset in milliseconds
-  # generate the new ffmetadata chapter information with new offset
   local meta_file="$1"
   local offset="$2"
-  local chapters=$(jq -r '.chapters' "$meta_file")
-  local chapter_data=""
 
-  local filename=$(jq -r '.format.filename' "$meta_file")
-  local duration=$(jq -r '.format.duration' "$meta_file")
-  duration=$(sec2msInt $duration)
-  local start_time=$(jq -r '.format.start_time' "$meta_file")
-  start_time=$(sec2msInt $start_time)
-
-  # WARN: the space after the initial jq pipe '| ' needs to be there
+  # Single JSON parse with type conversion
+  local chapter_data
   chapter_data=$(jq -r --argjson offset "$offset" '
-        .chapters[] | 
-        "[CHAPTER]\n" +
-        "TIMEBASE=1/1000\n" +
-        "START=\(.start + $offset)\n" +
-        "END=\(.end + $offset)\n" +
-        "title=\(.tags.title // "Untitled")\n"
-    ' "$meta_file")
+    def sec2ms: (. | tonumber) * 1000 | floor;
 
-  if [ -z "$chapter_data" ]; then
-    # echo "No chapter found, using filename as chapter"
-    chapter_data=$(jq -r --argjson offset "$offset" --argjson start "$start_time" --argjson end "$duration" '
-        .format | 
-        "[CHAPTER]\n" +
-        "TIMEBASE=1/1000\n" +
-        "START=\($start + $offset)\n" +
-        "END=\($end + $offset)\n" +
-        "title=\(.filename // "Untitled")\n"
-    ' "$meta_file")
+    (.chapters | length > 0) as $has_chapters |
+    (.format.filename // "Untitled" | sub("\\.[^.]+$"; "")) as $filename_base |
+    (.format.duration? // "0" | sec2ms) as $duration_ms |
+    (.format.start_time? // "0" | sec2ms) as $start_time_ms |
 
-  fi
+    if $has_chapters then
+      .chapters[] |
+      "[CHAPTER]\n" +
+      "TIMEBASE=1/1000\n" +
+      "START=\((.start | tonumber | sec2ms) + $offset)\n" +
+      "END=\((.end | tonumber | sec2ms) + $offset)\n" +
+      "title=\(.tags.title // $filename_base)\n"
+    else
+      "[CHAPTER]\n" +
+      "TIMEBASE=1/1000\n" +
+      "START=\($start_time_ms + $offset)\n" +
+      "END=\($start_time_ms + $offset + $duration_ms)\n" +
+      "title=\($filename_base)\n"
+    end
+  ' "$meta_file")
 
   printf "%s\n" "$chapter_data"
 }
-
-# HACK:
-# generate_chapter_info() {
-#   local meta_file="$1"
-#   local offset="$2"
-#
-#   # Extract filename without extension for fallback title
-#   local filename_base
-#   filename_base=$(basename "$meta_file" | sed 's/\.[^.]*$//')
-#
-#   # Generate chapter data
-#   local chapter_data
-#   chapter_data=$(jq -r \
-#     --argjson offset "$offset" \
-#     --arg filename_base "$filename_base" '
-#       if (.chapters | length) > 0 then
-#         # Process existing chapters
-#         .chapters[] |
-#         "[CHAPTER]\n" +
-#         "TIMEBASE=1/1000\n" +
-#         "START=\(.start + $offset)\n" +
-#         "END=\(.end + $offset)\n" +
-#         "title=\(.tags.title // $filename_base)\n"
-#       else
-#         # Create single chapter using filename as title
-#         ( .format.duration? // 0 ) as $dur |
-#         "[CHAPTER]\n" +
-#         "TIMEBASE=1/1000\n" +
-#         "START=\($offset)\n" +
-#         "END=\($offset + ($dur * 1000 | floor))\n" +
-#         "title=\($filename_base)\n"
-#       end
-#     ' "$meta_file")
-#
-#   printf "%s\n" "$chapter_data"
-# }
 
 extract_cover_art() {
   local input_file="$1"
@@ -137,21 +94,13 @@ process_input_files() {
 
     generate_ffmpeg_file_list() {
       # generate concat demuxer input file line
-
       # NOTE: replace any single quotes with escaped single quotes https://trac.ffmpeg.org/wiki/Concatenate
       # absolute_path="/path/to/file/Author's Notes (Final).m4a"
       ffmpeg_path=${absolute_path//\'/\'\\\'\'}
-
-      # Okay trying with separate string and quoted string arguments
-      # TEST:
-      # printf "file '%s'\n" "${absolute_path//\'/\'\\\'\'}" >>"$list_file"
-
-      ## NOTE: Going back to Echo with a pre-processed single quote escaped string variable
-      # echo "file '${ffmpeg_path}'" >>"$list_file"
       echo "file '${ffmpeg_path}'"
-
     }
     generate_ffmpeg_file_list >>"$file_list"
+
     # Extract metadata
     meta_file="$tmpdir/meta$i.json"
     ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
@@ -165,20 +114,19 @@ process_input_files() {
     fi
 
     # Get original file duration in seconds (floating-point) for precision in file comparison
-    duration=$(jq -r '.format.duration' "$meta_file")
+    file_duration=$(jq -r '.format.duration' "$meta_file")
 
     # For integer milliseconds (rounded):
-    rounded_ms=$(sec2msInt $duration)
+    rounded_ms=$(sec2msInt $file_duration)
 
     # process_chapters
-    result=$(generate_chapter_info "$meta_file" "$cumulative_offset")
-    printf "%s" "$result" >>"$chapters_file"
+    generate_chapter_info "$meta_file" "$cumulative_offset" >>"$chapters_file"
 
     # set each file offset to running total of duration_ms as integer.
     cumulative_offset=$((cumulative_offset + rounded_ms))
 
-    # Keep total in seconds with full precision and compare later as milliseconds
-    durations+=("$duration")
+    # Store total file durations in seconds with full precision and compare later as milliseconds
+    durations+=("$file_duration")
   done
 }
 
@@ -266,8 +214,8 @@ sec2msInt() {
 
 get_file_duration_in_ms() {
   local file="$1"
-  duration=$(ffprobe -v quiet -i "$file" -show_format -of json | jq -r '.format.duration')
-  duration_ms=$(sec2msInt $duration)
+  file_duration=$(ffprobe -v quiet -i "$file" -show_format -of json | jq -r '.format.duration')
+  duration_ms=$(sec2msInt $file_duration)
   echo "$duration_ms"
 }
 
