@@ -8,9 +8,9 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
-# Create safe temporary directory
+# # Create safe temporary directory
 tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
-output_dir=""
+output_dir=$(dirname "$1")
 cleanup_needed=true
 
 # Set conditional trap
@@ -30,10 +30,11 @@ for input in "$@"; do
     while IFS= read -r -d $'\0' file; do
       if { file -b --mime-type "$file" | grep -qiE 'audio/(mp4|x-m4a|aac)'; } \
         || [[ "$file" =~ \.(m4a|m4b)$ ]]; then
-        # aac_files+=("$file")
-        valid_files+=("$file")
+        aac_files+=("$file")
       fi
     done < <(find "$input" -type f -print0)
+    IFS=$'\n' valid_files=($(sort <<<"${aac_files[*]}"))
+    unset IFS
   elif [[ -f "$input" ]]; then
     # Handle single file
     valid_files+=("$input")
