@@ -10,18 +10,40 @@ fi
 
 # Create safe temporary directory
 tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
+output_dir=""
 cleanup_needed=true
 
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
-# Initialize arrays
-declare -a input_files=("$@")
+# Initialize file arrays
+declare -a valid_files=()
 declare -a durations
 declare -a meta_files
 declare -a cover_images
 
-# NOTE: fairly well organized
+# Process input arguments (files/directories)
+for input in "$@"; do
+  if [[ -d "$input" ]]; then
+    # Handle directory - process all files in directory
+    output_dir=$input
+    while IFS= read -r -d $'\0' file; do
+      if { file -b --mime-type "$file" | grep -qiE 'audio/(mp4|x-m4a|aac)'; } \
+        || [[ "$file" =~ \.(m4a|m4b)$ ]]; then
+        # aac_files+=("$file")
+        valid_files+=("$file")
+      fi
+    done < <(find "$input" -type f -print0)
+  elif [[ -f "$input" ]]; then
+    # Handle single file
+    valid_files+=("$input")
+  else
+    echo "Error: '$input' is not a valid file or directory" >&2
+    exit 1
+  fi
+done
+
+# PERF: fairly well organized
 generate_chapter_info() {
   local meta_file="$1"
   local offset="$2"
@@ -87,8 +109,8 @@ process_input_files() {
   file_list="$tmpdir/list.txt"
 
   # NOTE: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
-  for i in "${!input_files[@]}"; do
-    file="${input_files[$i]}"
+  for i in "${!valid_files[@]}"; do
+    file="${valid_files[$i]}"
     absolute_path=$(realpath "$file")
     echo "Processing $file..."
 
@@ -165,8 +187,8 @@ generate_ffmetadata() {
   cat "$chapters_file" >>"$combined_meta"
 }
 
-merge_audiobooks() {
-  # Merge files and apply metadata
+merge_m4a_files() {
+  # Merge m4a files and apply metadata
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
 
@@ -242,16 +264,6 @@ verify_merged_file() {
   expected_duration=$(sec2msInt $sum_seconds)
   echo "Expected duration in ms: $expected_duration"
 
-  # if [ "$merged_duration" -eq "$expected_duration" ]; then
-  #   echo "Duration verification passed"
-  # else
-  #   echo "Warning: Merged file duration ($merged_duration ms) does not match sum of input durations ($expected_duration ms)"
-  #   # If failure occurs:
-  #   open "$tmpdir"
-  #   cleanup_needed=false
-  #   return 1
-  # fi
-
   # Allow for a small margin of error (e.g., 1 second = 1000 ms)
   margin=1000
   difference=$((merged_duration - expected_duration))
@@ -267,14 +279,14 @@ verify_merged_file() {
 
 process_input_files
 generate_ffmetadata
-merge_audiobooks
+merge_m4a_files
 # add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
 verify_merged_file
 
-# Move final file to current directory
-final_output="$artist-$album.m4b"
-mv "$tmpdir/merged.m4a" "./$final_output"
-mv "$combined_meta" .
-mv "$chapters_file" .
+# Move final file to directory # ${output_dir}
+final_output="$output_dir/$artist-$album.m4b"
+mv "$tmpdir/merged.m4a" "$final_output"
+mv "$combined_meta" "$output_dir"
+mv "$chapters_file" "$output_dir"
 
-echo "Successfully created: $final_output"
+echo "Successfully created: ${final_output}"
