@@ -5,13 +5,10 @@ FROM lscr.io/linuxserver/ffmpeg:latest
 WORKDIR /app
 
 # Copy your script into the container at /app/
-COPY ./merge_audiobook.sh /app/
+COPY merge_audiobook.sh /usr/local/bin/
 
 # Make the script executable 
-RUN chmod +x /app/merge_audiobook.sh
-
-# Optional: Install any missing dependencies (if needed)
-# RUN apt-get update && apt-get install -y --no-install-recommends <missing_dependencies>
+RUN chmod +x /usr/local/bin/merge_audiobook.sh
 
 # Run your script
-CMD ["/app/merge_audiobook.sh"]
+ENTRYPOINT ["/usr/local/bin/merge_audiobook.sh"]
