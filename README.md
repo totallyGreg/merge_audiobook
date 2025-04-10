@@ -10,6 +10,7 @@ It leverages FFmpeg for the merging process and a bit of jq to process the metad
 
 - FFmpeg ffprobe
 - jq
+- bc
 
 ## Building the Docker Image
 
@@ -44,5 +45,6 @@ To run the script:
 Running it from a container should be the same
 
 ```bash
-docker run merge_audiobook *.m4b
+alias merge-audiobook='docker run --rm -u $(id -u):$(id -g) -v "$(pwd)":/app merge-audiobook'
+merge_audiobook *.m4b
 ```

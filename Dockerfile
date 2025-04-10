@@ -1,6 +1,13 @@
 # Use a base image
 FROM lscr.io/linuxserver/ffmpeg:latest
 
+# HACK: works but adds a ton to image
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ffmpeg \
+  bc && \
+  # ... other dependencies ... && \
+  rm -rf /var/lib/apt/lists/*
+
 # Set working directory
 WORKDIR /app
 
