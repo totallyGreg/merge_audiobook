@@ -10,7 +10,10 @@ fi
 
 # # Create safe temporary directory
 tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
-output_dir=$(dirname "$1")
+converted_pipe="$tmpdir/converted_file"
+mkfifo "$converted_pipe"
+# output_dir=$(dirname "$1")
+output_dir=$(pwd)
 cleanup_needed=true
 
 # Set conditional trap
@@ -22,29 +25,43 @@ declare -a durations
 declare -a meta_files
 declare -a cover_images
 
-# Process input arguments (files/directories)
-for input in "$@"; do
-  if [[ -d "$input" ]]; then
-    # Handle directory - process all files in directory
-    output_dir=$input
-    while IFS= read -r -d $'\0' file; do
-      if { file -b --mime-type "$file" | grep -qiE 'audio/(mp4|x-m4a|aac)'; } \
-        || [[ "$file" =~ \.(m4a|m4b)$ ]]; then
-        aac_files+=("$file")
-      fi
-    done < <(find "$input" -type f -print0)
-    IFS=$'\n' valid_files=($(sort <<<"${aac_files[*]}"))
-    unset IFS
-  elif [[ -f "$input" ]]; then
-    # Handle single file
-    valid_files+=("$input")
-  else
-    echo "Error: '$input' is not a valid file or directory" >&2
-    exit 1
+convert_mp3_to_m4b() {
+  # TODO: need to extract any metadata before converting
+  local input_mp3="${1}"
+  local output_m4b
+  local afconvert_path=$(which afconvert)
+
+  # Check if afconvert is installed
+  if [[ -z "${afconvert_path}" ]]; then
+    echo "Error: afconvert is not installed.  This script requires macOS." >&2
+    return 1 # Indicate failure
   fi
-done
+
+  # Construct output filename (replace .mp3 with .m4b)
+  output_m4b="$tmpdir/${input_mp3%.mp3}.m4b"
+
+  # Convert an audiofile to m4b with variable bitrate
+  # -s 3 = ABR
+  # --soundcheck-generate: Generate soundcheck data for volume normalization
+  # -f m4bf: Output format (M4B audiobook)
+  # -d aach: MPEG-4 High Efficiency AAC
+  # -q 10: Quality level (10 is high)
+  # echo "Converting $input_mp3 to $output_m4b..."
+  "${afconvert_path}" --media-kind "Audiobook" --soundcheck-generate "${input_mp3}" -s 3 -f m4bf -d aach -q 10 "${output_m4b}"
+
+  # Check the exit code of afconvert
+  if [[ $? -ne 0 ]]; then
+    echo "Error: afconvert failed to convert $input_mp3 to $output_m4b." >&2
+    return 1 # Indicate failure
+  fi
+
+  # echo "✅Successfully converted $input_mp3 👉🏽 $output_m4b"
+  # echo "$output_m4b" >"$converted_pipe" # Return the output filename
+  echo "$output_m4b"
+}
 
 # PERF: fairly well organized
+# TODO: this should be called recursively but MUST be sorted first
 generate_chapter_info() {
   local meta_file="$1"
   local offset="$2"
@@ -105,11 +122,16 @@ cumulative_offset=0
 chapters_file="$tmpdir/chapters.txt"
 
 # Process each input file
-process_input_files() {
+process_valid_files() {
+  # Valid meaning already converted m4a files that can be concated OR
+  # TODO: refactor this to be called directly by process_argument and or process_directory
+  # and in turn build up the valid_files list by callng process_file to ensure they're valid
+
+  echo "Begin Processing valid_files array containing ${#valid_files[*]} files"
   # Create file list (with proper quoting)
   file_list="$tmpdir/list.txt"
 
-  # NOTE: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
+  # HACK: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
   for i in "${!valid_files[@]}"; do
     file="${valid_files[$i]}"
     absolute_path=$(realpath "$file")
@@ -152,6 +174,70 @@ process_input_files() {
     durations+=("$file_duration")
   done
 }
+
+# Function to process a single file
+process_file() {
+  # Constants - avoid magic strings
+  AUDIO_MP3="audio/mpeg"
+  FILE_MP3=".mp3"
+  AUDIO_M4A="audio/x-m4a"
+  FILE_M4A=".m4a"
+  FILE_M4B=".m4b"
+  # This function processes files (if necessary) and builds the valid_files array
+  local file="$1"
+  local mime_type
+  local aac_file
+
+  mime_type=$(file -b --mime-type "$file")
+
+  if [[ "$mime_type" =~ $AUDIO_M4A ]] || [[ "$file" =~ $FILE_M4A ]] || [[ "$file" =~ $FILE_M4B ]]; then
+    echo "Adding M4A file: $file to valid_files array" # Replace with actual processing
+    aac_file=("$file")
+  elif [[ "$mime_type" =~ $AUDIO_MP3 ]] || [[ "$file" =~ $FILE_MP3 ]]; then
+    local converted_file
+    echo "Converting MP3: $file to M4B:"
+    converted_file=$(convert_mp3_to_m4b "$file")
+    # read -r converted_file <converted_pipe
+    echo "Adding M4A file: $converted_file to valid_files array" # Replace with actual processing
+    aac_file=("$converted_file")
+  else
+    echo "Skipping file: $file (unsupported type)"
+  fi
+  valid_files+=("$aac_file")
+}
+
+# Recursive function to process a directory
+process_directory() {
+  local dir="$1"
+  output_dir="$dir"
+
+  # Find all files in the directory and send to process_file in sorted order
+  # -z: This option tells sort to use null characters (\0) as delimiters.
+  # This is essential when dealing with filenames that contain spaces or other special characters.
+  # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
+  find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
+    process_file "$file"
+  done
+}
+
+# Process input arguments (files/directories)
+process_argument() {
+  local arg="$1"
+
+  if [[ -d "$arg" ]]; then
+    process_directory "$arg"
+    # TODO: consider calling process_valid_files for directories here
+  elif [[ -f "$arg" ]]; then
+    process_file "$arg"
+  else
+    echo "Error: '$arg' is not a valid file or directory" >&2
+    exit 1
+  fi
+}
+
+for input in "$@"; do
+  process_argument "$input"
+done
 
 get_required_tags() {
   set -e
@@ -278,7 +364,7 @@ verify_merged_file() {
   fi
 }
 
-process_input_files
+process_valid_files
 generate_ffmetadata
 merge_m4a_files
 # add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
