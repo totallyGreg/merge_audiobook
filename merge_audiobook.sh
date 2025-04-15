@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -euox pipefail
 
 # Check for input files
 # NOTE: this currently assumes m4a/b audiofiles
@@ -14,7 +14,7 @@ converted_pipe="$tmpdir/converted_file"
 mkfifo "$converted_pipe"
 # output_dir=$(dirname "$1")
 output_dir=$(pwd)
-cleanup_needed=true
+cleanup_needed=false
 
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
@@ -121,33 +121,37 @@ artist=""
 cumulative_offset=0
 chapters_file="$tmpdir/chapters.txt"
 
-# Process each input file
-process_valid_files() {
-  # Valid meaning already converted m4a files that can be concated OR
+# Process each input file into an audiobook
+process_audiobook() {
   # TODO: refactor this to be called directly by process_argument and or process_directory
-  # and in turn build up the valid_files list by callng process_file to ensure they're valid
+  # accept list of files as $@ iterate through each using process_file
+  # to build up the valid_files list
 
   echo "Begin Processing valid_files array containing ${#valid_files[*]} files"
   # Create file list (with proper quoting)
   file_list="$tmpdir/list.txt"
+
+  # function to generate concat demuxer input file line
+  generate_ffmpeg_file_list() {
+    # NOTE: replace any single quotes with escaped single quotes https://trac.ffmpeg.org/wiki/Concatenate
+    # absolute_path="/path/to/file/Author's Notes (Final).m4a"
+    ffmpeg_path=${absolute_path//\'/\'\\\'\'}
+    echo "file '${ffmpeg_path}'"
+  }
 
   # HACK: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
   for i in "${!valid_files[@]}"; do
     file="${valid_files[$i]}"
     absolute_path=$(realpath "$file")
     echo "Processing $file..."
+    # TODO: call process_file here
+    # return only valid m4a/m4b files
 
-    generate_ffmpeg_file_list() {
-      # generate concat demuxer input file line
-      # NOTE: replace any single quotes with escaped single quotes https://trac.ffmpeg.org/wiki/Concatenate
-      # absolute_path="/path/to/file/Author's Notes (Final).m4a"
-      ffmpeg_path=${absolute_path//\'/\'\\\'\'}
-      echo "file '${ffmpeg_path}'"
-    }
     generate_ffmpeg_file_list >>"$file_list"
 
     # Extract metadata
     meta_file="$tmpdir/meta$i.json"
+    # NOTE: this works for mp3 `ffprobe -show_format -of json 39\ Backsliders.mp3`
     ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
     meta_files+=("$meta_file")
 
@@ -173,6 +177,20 @@ process_valid_files() {
     # Store total file durations in seconds with full precision and compare later as milliseconds
     durations+=("$file_duration")
   done
+
+  generate_ffmetadata
+  merge_m4a_files
+  # add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
+  verify_merged_file
+
+  # Move final file to directory # ${output_dir}
+  # TODO: fix "-.m4b" file being created if no artist/album when trying to cancel
+  final_output="$output_dir/$artist-$album.m4b"
+  mv "$tmpdir/merged.m4a" "$final_output"
+  mv "$combined_meta" "$output_dir"
+  mv "$chapters_file" "$output_dir"
+
+  echo "Successfully created: ${final_output}"
 }
 
 # Function to process a single file
@@ -259,7 +277,9 @@ get_required_tags() {
   done
 }
 
+# Generate required ffmpeg metadata file
 generate_ffmetadata() {
+  # WARN: Currently required tags is being run after mp3 conversion
   # combined_meta="$tmpdir/metafile.txt"
   combined_meta=$(printf "%q" "$tmpdir/metadata.txt")
   # Header and file creation
@@ -364,16 +384,4 @@ verify_merged_file() {
   fi
 }
 
-process_valid_files
-generate_ffmetadata
-merge_m4a_files
-# add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
-verify_merged_file
-
-# Move final file to directory # ${output_dir}
-final_output="$output_dir/$artist-$album.m4b"
-mv "$tmpdir/merged.m4a" "$final_output"
-mv "$combined_meta" "$output_dir"
-mv "$chapters_file" "$output_dir"
-
-echo "Successfully created: ${final_output}"
+process_audiobook
