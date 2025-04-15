@@ -115,17 +115,15 @@ add_cover_art() {
   fi
 }
 
-# Main loop
-album=""
-artist=""
-cumulative_offset=0
-chapters_file="$tmpdir/chapters.txt"
-
-# Process each input file into an audiobook
+# Process list of input files into an audiobook
 process_audiobook() {
   # TODO: refactor this to be called directly by process_argument and or process_directory
   # accept list of files as $@ iterate through each using process_file
   # to build up the valid_files list
+  album=""
+  artist=""
+  cumulative_offset=0
+  chapters_file="$tmpdir/chapters.txt"
 
   echo "Begin Processing valid_files array containing ${#valid_files[*]} files"
   # Create file list (with proper quoting)
@@ -140,6 +138,9 @@ process_audiobook() {
   }
 
   # HACK: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
+  # NOTE: Main processing loop
+  # validates files, converts if necessary, then builds both the ffmpeg_file_list
+  # and the FFMETADATA1 with tags, chapters and duration
   for i in "${!valid_files[@]}"; do
     file="${valid_files[$i]}"
     absolute_path=$(realpath "$file")
@@ -151,16 +152,15 @@ process_audiobook() {
 
     # Extract metadata
     meta_file="$tmpdir/meta$i.json"
-    # NOTE: this works for mp3 `ffprobe -show_format -of json 39\ Backsliders.mp3`
     ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
     meta_files+=("$meta_file")
 
     # Get cover image
     # HACK: assuming jpg for convenience
-    cover_image="$tmpdir/cover_$i.jpg"
-    if extract_cover_art "$file" "$cover_image"; then
-      cover_images+=("$cover_image")
-    fi
+    # cover_image="$tmpdir/cover_$i.jpg"
+    # if extract_cover_art "$file" "$cover_image"; then
+    #   cover_images+=("$cover_image")
+    # fi
 
     # Get original file duration in seconds (floating-point) for precision in file comparison
     file_duration=$(jq -r '.format.duration' "$meta_file")
@@ -193,15 +193,16 @@ process_audiobook() {
   echo "Successfully created: ${final_output}"
 }
 
-# Function to process a single file
+# processes a file (if supported audio) and builds the valid_files array
 process_file() {
+
   # Constants - avoid magic strings
   AUDIO_MP3="audio/mpeg"
   FILE_MP3=".mp3"
   AUDIO_M4A="audio/x-m4a"
   FILE_M4A=".m4a"
   FILE_M4B=".m4b"
-  # This function processes files (if necessary) and builds the valid_files array
+
   local file="$1"
   local mime_type
   local aac_file
@@ -224,26 +225,22 @@ process_file() {
   valid_files+=("$aac_file")
 }
 
-# Recursive function to process a directory
-process_directory() {
-  local dir="$1"
-  output_dir="$dir"
-
-  # Find all files in the directory and send to process_file in sorted order
-  # -z: This option tells sort to use null characters (\0) as delimiters.
-  # This is essential when dealing with filenames that contain spaces or other special characters.
-  # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
-  find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
-    process_file "$file"
-  done
-}
-
 # Process input arguments (files/directories)
 process_argument() {
   local arg="$1"
 
   if [[ -d "$arg" ]]; then
-    process_directory "$arg"
+    local dir="$arg"
+    output_dir="$dir"
+
+    # Find all files in the directory and send to process_file in sorted order
+    # -z: This option tells sort to use null characters (\0) as delimiters.
+    # This is essential when dealing with filenames that contain spaces or other special characters.
+    # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
+    find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
+      process_file "$file"
+    done
+    # process_directory "$arg"
     # TODO: consider calling process_valid_files for directories here
   elif [[ -f "$arg" ]]; then
     process_file "$arg"
@@ -279,12 +276,12 @@ get_required_tags() {
 
 # Generate required ffmpeg metadata file
 generate_ffmetadata() {
-  # WARN: Currently required tags is being run after mp3 conversion
   # combined_meta="$tmpdir/metafile.txt"
   combined_meta=$(printf "%q" "$tmpdir/metadata.txt")
   # Header and file creation
   echo ";FFMETADATA1" >"$combined_meta"
   # Global Metadata (year does not appear to be supported)
+  # WARN: Currently required tags is being run after mp3 conversion
   # NOTE: currently only parsing first file
   # get_required_tags "$tmpdir/meta0.json" "artist" "album" "album_artist" >>"$combined_meta"
   get_required_tags "$tmpdir/meta0.json" "artist" "album" >>"$combined_meta"
