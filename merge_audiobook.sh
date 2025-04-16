@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euox pipefail
+set -euo pipefail
 
 # Check for input files
 # NOTE: this currently assumes m4a/b audiofiles
@@ -10,20 +10,14 @@ fi
 
 # # Create safe temporary directory
 tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
-converted_pipe="$tmpdir/converted_file"
-mkfifo "$converted_pipe"
+# converted_pipe="$tmpdir/converted_file"
+# mkfifo "$converted_pipe"
 # output_dir=$(dirname "$1")
 output_dir=$(pwd)
 cleanup_needed=false
 
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
-
-# Initialize file arrays
-declare -a valid_files=()
-declare -a durations
-declare -a meta_files
-declare -a cover_images
 
 convert_mp3_to_m4b() {
   # TODO: need to extract any metadata before converting
@@ -115,17 +109,87 @@ add_cover_art() {
   fi
 }
 
+# processes a file (if supported audio) and builds the valid_files array
+process_file() {
+  local file="$1"
+  local mime_type
+  local aac_file
+
+  echo "Processing $file..."
+
+  mime_type=$(file -b --mime-type "$file")
+
+  if [[ "$mime_type" =~ $AUDIO_M4A ]] || [[ "$file" =~ $FILE_M4A ]] || [[ "$file" =~ $FILE_M4B ]]; then
+    # echo "Adding M4A file: $file to aac_file"
+    aac_file="$file"
+  elif [[ "$mime_type" =~ $AUDIO_MP3 ]] || [[ "$file" =~ $FILE_MP3 ]]; then
+    local converted_file
+    artist=$(ffprobe -loglevel error -show_entries format_tags=artist -of default=noprint_wrappers=1:nokey=1 "$file")
+    album=$(ffprobe -loglevel error -show_entries format_tags=album -of default=noprint_wrappers=1:nokey=1 "$file")
+
+    echo "Converting MP3: $file to M4B:"
+    converted_file=$(convert_mp3_to_m4b "$file")
+    # read -r converted_file <converted_pipe
+    # echo "Adding M4A file: $converted_file to aac_file" # Replace with actual processing
+    aac_file="$converted_file"
+  else
+    echo "Skipping file: $file (unsupported type)"
+  fi
+
+  # Extract metadata from file
+  meta_file="$tmpdir/${file}.json"
+
+  ffprobe -v quiet -i "$aac_file" -show_chapters -show_format -of json >"$meta_file"
+
+  [[ -n $aac_file ]] && echo "Adding M4A file: $aac_file to valid_files array" # Replace with actual processing
+
+  valid_files+=("$aac_file")
+  absolute_path=$(realpath "$aac_file")
+  generate_ffmpeg_file_list >>"$file_list"
+  echo "Valid file count: ${#valid_files[*]}"
+
+  # Get original file duration in seconds (floating-point) for precision in file comparison
+  file_duration=$(jq -r '.format.duration' "$meta_file")
+
+  # For integer milliseconds (rounded):
+  rounded_ms=$(sec2msInt $file_duration)
+
+  # process_chapters
+  generate_chapter_info "$meta_file" "$cumulative_offset" >>"$chapters_file"
+
+  cumulative_offset=$((cumulative_offset + rounded_ms)) # NOTE: set each file offset to running total of duration_ms as integer.
+  durations+=("$file_duration")                         # NOTE: Store total file durations in seconds with full precision and compare later as milliseconds
+  meta_files+=("$meta_file")                            # NOTE: Store meta data file location in array
+}
+
 # Process list of input files into an audiobook
 process_audiobook() {
+  # Given 1 or more files including a directory
+  # Process the file with the minimum required tags into an m4b audiobok file
+
+  # Constants - avoid magic strings
+  AUDIO_MP3="audio/mpeg"
+  FILE_MP3=".mp3"
+  AUDIO_M4A="audio/x-m4a"
+  FILE_M4A=".m4a"
+  FILE_M4B=".m4b"
+
+  # Initialize file arrays
+  declare -a valid_files=()
+  declare -a durations
+  declare -a meta_files
+  declare -a cover_images
+
   # TODO: refactor this to be called directly by process_argument and or process_directory
   # accept list of files as $@ iterate through each using process_file
   # to build up the valid_files list
+  #
+
   album=""
   artist=""
   cumulative_offset=0
   chapters_file="$tmpdir/chapters.txt"
 
-  echo "Begin Processing valid_files array containing ${#valid_files[*]} files"
   # Create file list (with proper quoting)
   file_list="$tmpdir/list.txt"
 
@@ -137,48 +201,42 @@ process_audiobook() {
     echo "file '${ffmpeg_path}'"
   }
 
-  # HACK: I am assuming the first file has the correct metadata values and ignoring the rest except chapter info
   # NOTE: Main processing loop
-  # validates files, converts if necessary, then builds both the ffmpeg_file_list
+  # validates list files, converts if necessary, then builds both the ffmpeg_file_list
   # and the FFMETADATA1 with tags, chapters and duration
-  for i in "${!valid_files[@]}"; do
-    file="${valid_files[$i]}"
-    absolute_path=$(realpath "$file")
-    echo "Processing $file..."
-    # TODO: call process_file here
-    # return only valid m4a/m4b files
+  local arg="$@"
 
-    generate_ffmpeg_file_list >>"$file_list"
+  echo "Argument: $arg received"
+  for arg; do
+    if [[ -d "$arg" ]]; then
+      local dir="$arg"
+      output_dir="$dir"
 
-    # Extract metadata
-    meta_file="$tmpdir/meta$i.json"
-    ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
-    meta_files+=("$meta_file")
+      # Find all files in the directory and send to process_file in sorted order
+      # -z: This option tells sort to use null characters (\0) as delimiters.
+      # This is essential when dealing with filenames that contain spaces or other special characters.
+      # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
+      find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
+        process_file "$file"
+      done
+      # process_directory "$arg" # HACK: attempt at a recursion
+      # process_argument "${dir}"/* # HACK: only sends the first file to process_file
 
-    # Get cover image
-    # HACK: assuming jpg for convenience
-    # cover_image="$tmpdir/cover_$i.jpg"
-    # if extract_cover_art "$file" "$cover_image"; then
-    #   cover_images+=("$cover_image")
-    # fi
-
-    # Get original file duration in seconds (floating-point) for precision in file comparison
-    file_duration=$(jq -r '.format.duration' "$meta_file")
-
-    # For integer milliseconds (rounded):
-    rounded_ms=$(sec2msInt $file_duration)
-
-    # process_chapters
-    generate_chapter_info "$meta_file" "$cumulative_offset" >>"$chapters_file"
-
-    # set each file offset to running total of duration_ms as integer.
-    cumulative_offset=$((cumulative_offset + rounded_ms))
-
-    # Store total file durations in seconds with full precision and compare later as milliseconds
-    durations+=("$file_duration")
+    elif [[ -f "$arg" ]]; then
+      process_file "$arg"
+    else
+      echo "Error: '$arg' is not a valid file or directory" >&2
+      exit 1
+    fi
   done
 
-  generate_ffmetadata
+  # Get cover image
+  # HACK: assuming jpg for convenience
+  # cover_image="$tmpdir/cover_$i.jpg"
+  # if extract_cover_art "$file" "$cover_image"; then
+  #   cover_images+=("$cover_image")
+  # fi
+
   merge_m4a_files
   # add_cover_art WARN: adding the cover art works, but apparently removes the artist and album tags from the file... shruggie
   verify_merged_file
@@ -187,42 +245,10 @@ process_audiobook() {
   # TODO: fix "-.m4b" file being created if no artist/album when trying to cancel
   final_output="$output_dir/$artist-$album.m4b"
   mv "$tmpdir/merged.m4a" "$final_output"
-  mv "$combined_meta" "$output_dir"
+  mv "$ffmetadata" "$output_dir"
   mv "$chapters_file" "$output_dir"
 
   echo "Successfully created: ${final_output}"
-}
-
-# processes a file (if supported audio) and builds the valid_files array
-process_file() {
-
-  # Constants - avoid magic strings
-  AUDIO_MP3="audio/mpeg"
-  FILE_MP3=".mp3"
-  AUDIO_M4A="audio/x-m4a"
-  FILE_M4A=".m4a"
-  FILE_M4B=".m4b"
-
-  local file="$1"
-  local mime_type
-  local aac_file
-
-  mime_type=$(file -b --mime-type "$file")
-
-  if [[ "$mime_type" =~ $AUDIO_M4A ]] || [[ "$file" =~ $FILE_M4A ]] || [[ "$file" =~ $FILE_M4B ]]; then
-    echo "Adding M4A file: $file to valid_files array" # Replace with actual processing
-    aac_file=("$file")
-  elif [[ "$mime_type" =~ $AUDIO_MP3 ]] || [[ "$file" =~ $FILE_MP3 ]]; then
-    local converted_file
-    echo "Converting MP3: $file to M4B:"
-    converted_file=$(convert_mp3_to_m4b "$file")
-    # read -r converted_file <converted_pipe
-    echo "Adding M4A file: $converted_file to valid_files array" # Replace with actual processing
-    aac_file=("$converted_file")
-  else
-    echo "Skipping file: $file (unsupported type)"
-  fi
-  valid_files+=("$aac_file")
 }
 
 # Process input arguments (files/directories)
@@ -239,9 +265,10 @@ process_argument() {
     # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
     find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
       process_file "$file"
-    done
-    # process_directory "$arg"
-    # TODO: consider calling process_valid_files for directories here
+    done # NOTE: this actually works but prevents me from swapping the call directly to process_audiobook
+    # process_directory "$arg" # HACK: attempt at a recursion
+    # process_argument "${dir}"/* # HACK: only sends the first file to process_file
+
   elif [[ -f "$arg" ]]; then
     process_file "$arg"
   else
@@ -250,12 +277,7 @@ process_argument() {
   fi
 }
 
-for input in "$@"; do
-  process_argument "$input"
-done
-
 get_required_tags() {
-  set -e
   local json_file="$1"
   shift
   local required_tags=("$@")
@@ -277,26 +299,32 @@ get_required_tags() {
 # Generate required ffmpeg metadata file
 generate_ffmetadata() {
   # combined_meta="$tmpdir/metafile.txt"
-  combined_meta=$(printf "%q" "$tmpdir/metadata.txt")
+  ffmetadata=$(printf "%q" "$tmpdir/ffmetadata.txt")
   # Header and file creation
-  echo ";FFMETADATA1" >"$combined_meta"
+  echo ";FFMETADATA1" >"$ffmetadata"
   # Global Metadata (year does not appear to be supported)
-  # WARN: Currently required tags is being run after mp3 conversion
   # NOTE: currently only parsing first file
-  # get_required_tags "$tmpdir/meta0.json" "artist" "album" "album_artist" >>"$combined_meta"
-  get_required_tags "$tmpdir/meta0.json" "artist" "album" >>"$combined_meta"
-
+  if [[ -n $artist ]]; then
+    echo "artist=$artist" >>$ffmetadata
+    echo "album=$album" >>$ffmetadata
+  else
+    get_required_tags "${meta_files[0]}" "artist" "album" >>"$ffmetadata"
+  fi
   # [Stream] Metadata placeholder
   # [Chapter] Metadata
-  cat "$chapters_file" >>"$combined_meta"
+  cat "$chapters_file" >>"$ffmetadata"
 }
 
+# Merge m4a files with metadata
 merge_m4a_files() {
-  # Merge m4a files and apply metadata
+  # requires file merge list created by generate_ffmpeg_file_list
+  # and required tags and chapters created with generate_ffmetadata
+  generate_ffmetadata
+
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
 
-  echo "Merging files..."
+  echo "Merging $(cat $file_list | wc -l) files..."
   # Use an array to store command components
   local ffmpeg_args=()
 
@@ -307,7 +335,7 @@ merge_m4a_files() {
     -f concat
     -safe 0
     -i "$file_list" # Escape special chars
-    -i "$(printf "%q" "$combined_meta")"
+    -i "$(printf "%q" "$ffmetadata")"
   )
 
   # Add mapping and encoding options
@@ -381,4 +409,10 @@ verify_merged_file() {
   fi
 }
 
-process_audiobook
+# for input in "$@"; do
+#   # process_argument "$input"
+#   process_audiobook "$input"
+# done
+
+process_audiobook "$@"
+# "${@:-process_audiobook}"
