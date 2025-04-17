@@ -14,7 +14,14 @@ tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
 # mkfifo "$converted_pipe"
 # output_dir=$(dirname "$1")
 output_dir=$(pwd)
-cleanup_needed=false
+cleanup_needed=true
+
+ok() { echo -e '\033[1;32m'"$1"'\033[0m'; }
+warn() { echo -e '\033[1;33m'"$1"'\033[0m'; }
+error() {
+  echo -e '\033[1;31mERROR: '"$1"'\033[0m'
+  logger "$1"
+}
 
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
@@ -27,7 +34,7 @@ convert_mp3_to_m4b() {
 
   # Check if afconvert is installed
   if [[ -z "${afconvert_path}" ]]; then
-    echo "Error: afconvert is not installed.  This script requires macOS." >&2
+    error "afconvert is not installed.  This script requires macOS." >&2
     return 1 # Indicate failure
   fi
 
@@ -45,7 +52,7 @@ convert_mp3_to_m4b() {
 
   # Check the exit code of afconvert
   if [[ $? -ne 0 ]]; then
-    echo "Error: afconvert failed to convert $input_mp3 to $output_m4b." >&2
+    error "afconvert failed to convert $input_mp3 to $output_m4b." >&2
     return 1 # Indicate failure
   fi
 
@@ -109,6 +116,18 @@ add_cover_art() {
   fi
 }
 
+# Function to process a directory
+process_directory() {
+  local dir="$1"
+  # echo "Entering directory: $dir"
+  # pushd "$dir" || return
+  # ls * |xargs -n 1 -- ${(%):-%x} process_file
+  ls "$dir/*" | xargs -n 1 -- ${0} process_file
+
+  # echo "Exiting directory: $dir"
+  # popd >/dev/null
+}
+
 # processes a file (if supported audio) and builds the valid_files array
 process_file() {
   local file="$1"
@@ -116,6 +135,7 @@ process_file() {
   local aac_file
 
   echo "Processing $file..."
+  start_timestamp=$(date +%s)
 
   mime_type=$(file -b --mime-type "$file")
 
@@ -133,7 +153,7 @@ process_file() {
     # echo "Adding M4A file: $converted_file to aac_file" # Replace with actual processing
     aac_file="$converted_file"
   else
-    echo "Skipping file: $file (unsupported type)"
+    warn "Skipping file: $file (unsupported type)"
   fi
 
   # Extract metadata from file
@@ -141,12 +161,12 @@ process_file() {
 
   ffprobe -v quiet -i "$aac_file" -show_chapters -show_format -of json >"$meta_file"
 
-  [[ -n $aac_file ]] && echo "Adding M4A file: $aac_file to valid_files array" # Replace with actual processing
+  # [[ -n $aac_file ]] && echo "Adding M4A file: $aac_file to valid_files array" # Replace with actual processing
 
   valid_files+=("$aac_file")
   absolute_path=$(realpath "$aac_file")
   generate_ffmpeg_file_list >>"$file_list"
-  echo "Valid file count: ${#valid_files[*]}"
+  warn "Valid file count: ${#valid_files[*]}"
 
   # Get original file duration in seconds (floating-point) for precision in file comparison
   file_duration=$(jq -r '.format.duration' "$meta_file")
@@ -160,6 +180,10 @@ process_file() {
   cumulative_offset=$((cumulative_offset + rounded_ms)) # NOTE: set each file offset to running total of duration_ms as integer.
   durations+=("$file_duration")                         # NOTE: Store total file durations in seconds with full precision and compare later as milliseconds
   meta_files+=("$meta_file")                            # NOTE: Store meta data file location in array
+
+  # end_timestamp=$(date +%s)
+  # elapsed_time=$(expr $end_timestamp - $start_timestamp) # WARN: this seems to stop processing of the function
+  # echo "Elapsed: $elapsed_time seconds"
 }
 
 # Process list of input files into an audiobook
@@ -206,7 +230,7 @@ process_audiobook() {
   # and the FFMETADATA1 with tags, chapters and duration
   local arg="$@"
 
-  echo "Argument: $arg received"
+  warn "Argument: $arg received"
   for arg; do
     if [[ -d "$arg" ]]; then
       local dir="$arg"
@@ -216,16 +240,16 @@ process_audiobook() {
       # -z: This option tells sort to use null characters (\0) as delimiters.
       # This is essential when dealing with filenames that contain spaces or other special characters.
       # Without -z, sort would misinterpret spaces as delimiters, leading to incorrect sorting.
-      find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
-        process_file "$file"
-      done
-      # process_directory "$arg" # HACK: attempt at a recursion
+      # find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
+      #   process_file "$file"
+      # done
+      process_directory "$arg" # HACK: attempt at a recursion
       # process_argument "${dir}"/* # HACK: only sends the first file to process_file
 
     elif [[ -f "$arg" ]]; then
       process_file "$arg"
     else
-      echo "Error: '$arg' is not a valid file or directory" >&2
+      error "'$arg' is not a valid file or directory" >&2
       exit 1
     fi
   done
@@ -248,7 +272,7 @@ process_audiobook() {
   mv "$ffmetadata" "$output_dir"
   mv "$chapters_file" "$output_dir"
 
-  echo "Successfully created: ${final_output}"
+  ok "Successfully created: ${final_output}"
 }
 
 # Process input arguments (files/directories)
@@ -272,7 +296,7 @@ process_argument() {
   elif [[ -f "$arg" ]]; then
     process_file "$arg"
   else
-    echo "Error: '$arg' is not a valid file or directory" >&2
+    error "'$arg' is not a valid file or directory" >&2
     exit 1
   fi
 }
@@ -324,6 +348,7 @@ merge_m4a_files() {
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
 
+  echo "==========================================="
   echo "Merging $(cat $file_list | wc -l) files..."
   # Use an array to store command components
   local ffmpeg_args=()
@@ -394,7 +419,7 @@ verify_merged_file() {
   echo "Merged file duration in ms: $merged_duration"
 
   expected_duration=$(sec2msInt $sum_seconds)
-  echo "Expected duration in ms: $expected_duration"
+  warn "Expected duration in ms: $expected_duration"
 
   # Allow for a small margin of error (e.g., 1 second = 1000 ms)
   margin=1000
@@ -402,10 +427,10 @@ verify_merged_file() {
   difference_abs=${difference#-} # Remove minus sign if present
 
   if [ "$difference_abs" -gt "$margin" ]; then
-    echo "Warning: Merged file duration ($merged_duration ms) differs significantly from sum of input durations ($expected_duration ms)" >&2
+    warn "Warning: Merged file duration ($merged_duration ms) differs significantly from sum of input durations ($expected_duration ms)" >&2
     exit 1
   else
-    echo "Duration verification passed: ${difference_abs}ms within $margin ms margin"
+    ok "Duration verification passed: ${difference_abs}ms within $margin ms margin"
   fi
 }
 
