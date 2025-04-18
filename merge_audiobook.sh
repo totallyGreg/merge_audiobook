@@ -26,39 +26,111 @@ error() {
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
-convert_mp3_to_m4b() {
-  # TODO: need to extract any metadata before converting
-  local input_mp3="${1}"
-  local output_m4b
+convert_to_m4b() {
+  local input_file="${1}"
+  # local output_file="${2:-${input_file%.*}.m4a}"
+  # If not given, construct output filename in tempdir (replace .mp3 with .m4b)
+  local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.m4b}"
   local afconvert_path=$(which afconvert)
 
-  # Check if afconvert is installed
+  # # Check if afconvert is installed
   if [[ -z "${afconvert_path}" ]]; then
     error "afconvert is not installed.  This script requires macOS." >&2
     return 1 # Indicate failure
   fi
 
-  # Construct output filename (replace .mp3 with .m4b)
-  output_m4b="$tmpdir/${input_mp3%.mp3}.m4b"
+  # Get audio metadata using afinfo
+  local metadata=$(afinfo "$input_file" | grep -E 'sample rate|bit rate')
+  local sample_rate=$(echo "$metadata" | grep 'sample rate' | awk '{print $3}')
+  local bit_rate=$(echo "$metadata" | grep 'bit rate' | awk '{print $3}' | sed 's/\..*//')
 
-  # Convert an audiofile to m4b with variable bitrate
-  # -s 3 = ABR
-  # --soundcheck-generate: Generate soundcheck data for volume normalization
-  # -f m4bf: Output format (M4B audiobook)
-  # -d aach: MPEG-4 High Efficiency AAC
-  # -q 10: Quality level (10 is high)
-  # echo "Converting $input_mp3 to $output_m4b..."
-  "${afconvert_path}" --media-kind "Audiobook" --soundcheck-generate "${input_mp3}" -s 3 -f m4bf -d aach -q 10 "${output_m4b}"
+  # Determine codec based on specifications
+  local codec="aac" # Default to AAC-LC
+  local strategy=2  # VBR constrained
+  local quality=127 # Highest quality
+  local bitrate_flag=""
 
-  # Check the exit code of afconvert
-  if [[ $? -ne 0 ]]; then
-    error "afconvert failed to convert $input_mp3 to $output_m4b." >&2
-    return 1 # Indicate failure
+  # if (( $(echo "$sample_rate <= 24000" | bc -l) )); then
+  #   codec="aach" # HE-AAC v2 (PS+SBR)
+  # elif (( $(echo "$sample_rate <= 32000" | bc -l) )); then
+  #   codec="aach" # HE-AAC v1 (SBR only)
+  # fi
+
+  if ((bit_rate >= 64000)) && [[ "$codec" == "aac" ]]; then
+    # Use AAC-LC with VBR for higher bitrates
+    strategy="3" # Full VBR mode
+    # bitrate_flag="-ue $quality"
+  elif ((bit_rate < 64000)) && [[ "$codec" == "aac" ]]; then
+    # Force HE codecs for low bitrates even if sample rate is high
+    codec="aach"
   fi
 
-  # echo "✅Successfully converted $input_mp3 👉🏽 $output_m4b"
-  # echo "$output_m4b" >"$converted_pipe" # Return the output filename
-  echo "$output_m4b"
+  # Construct afconvert command
+  local cmd=(
+    "${afconvert_path}" -f m4bf -d "$codec"
+    -s "$strategy"
+    -q "$quality"
+    --soundcheck-generate
+    --media-kind "Audiobook"
+    "${input_file}" "${output_file}"
+  )
+  # "$bitrate_flag"
+
+  # echo "Converting with: ${cmd[*]}"
+  "${cmd[@]}"
+  echo "${output_file}"
+}
+
+audio_to_caf() {
+  local input_file=${1}
+  # local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.caf}"
+  local output_file="${2:-${input_file%.mp3}.caf}"
+  # Converts MP3 → CAF (Apple's core audio format)
+  # Generates loudness metadata (--soundcheck-generate + --anchor-generate)
+  # Preserves original audio quality (-d 0 = no data format conversion)
+  afconvert "$input_file" -o "${output_file}" -d 0 -f caff \
+    --soundcheck-generate \
+    --anchor-generate
+
+  echo "${output_file}"
+}
+
+caf_to_m4b() {
+  local input_file=${1}
+  # local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.caf}"
+  local output_file="${2:-${input_file%.caf}.m4b}"
+  afconvert -f m4bf -d aac -q 127 -s 3 \
+    --soundcheck-read \
+    "${input_file}" -o "${output_file}"
+
+  echo "${output_file}"
+}
+
+audio_caf_m4b_pipeline() {
+  local input_files="${1}"
+  set -x
+  mkfifo audio_pipe.caf
+  trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
+
+  # WARN: soundcheck information is sent after file in named pipe so fails
+  #
+  # Start read pipe for convert in background
+  while IFS= read -r file; do
+    afconvert <(echo "$file") -f m4bf -d aac -q 127 -s 3 &
+  done &
+
+  while true; do
+    afconvert caff.pipe -f m4bf -d aac -q 127 -s 3 &
+  done &
+
+  # --soundcheck-read \
+
+  # Convert and feed to pipe
+  for file in $input_files; do
+    afconvert "$file" audio_pipe.caf -d 0 -f caff
+    # --soundcheck-generate \
+    # --anchor-generate
+  done
 }
 
 # PERF: fairly well organized
@@ -148,7 +220,8 @@ process_file() {
     album=$(ffprobe -loglevel error -show_entries format_tags=album -of default=noprint_wrappers=1:nokey=1 "$file")
 
     echo "Converting MP3: $file to M4B:"
-    converted_file=$(convert_mp3_to_m4b "$file")
+    # converted_file=$(convert_mp3_to_m4b "$file")
+    converted_file=$(convert_to_m4b "$file")
     # read -r converted_file <converted_pipe
     # echo "Adding M4A file: $converted_file to aac_file" # Replace with actual processing
     aac_file="$converted_file"
