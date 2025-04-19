@@ -24,13 +24,13 @@ error() {
 }
 
 # Set conditional trap
-trap '[[ $cleanup_needed == "true" ]] && { echo "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
+trap '[[ $cleanup_needed == "true" ]] && { ok "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
 convert_to_m4b() {
   local input_file="${1}"
   # local output_file="${2:-${input_file%.*}.m4a}"
   # If not given, construct output filename in tempdir (replace .mp3 with .m4b)
-  local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.m4b}"
+  local output_file="${2:-${tmpdir}/${input_file%.*}.m4b}"
   local afconvert_path=$(which afconvert)
 
   # # Check if afconvert is installed
@@ -82,9 +82,10 @@ convert_to_m4b() {
 }
 
 audio_to_caf() {
+  # NOTE: experiment to try and take any audio and pass through highest quality
   local input_file=${1}
   # local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.caf}"
-  local output_file="${2:-${input_file%.mp3}.caf}"
+  local output_file="${2:-${input_file%.*}.caf}"
   # Converts MP3 → CAF (Apple's core audio format)
   # Generates loudness metadata (--soundcheck-generate + --anchor-generate)
   # Preserves original audio quality (-d 0 = no data format conversion)
@@ -97,7 +98,6 @@ audio_to_caf() {
 
 caf_to_m4b() {
   local input_file=${1}
-  # local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.caf}"
   local output_file="${2:-${input_file%.caf}.m4b}"
   afconvert -f m4bf -d aac -q 127 -s 3 \
     --soundcheck-read \
@@ -107,8 +107,8 @@ caf_to_m4b() {
 }
 
 audio_caf_m4b_pipeline() {
+  # NOTE: named pipe experiment to reduce extra flle writing
   local input_files="${1}"
-  set -x
   mkfifo audio_pipe.caf
   trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
 
@@ -186,18 +186,6 @@ add_cover_art() {
   else
     mp4art --add "$tmpdir/cover_0.jpg" --preserve "$tmpdir/merged.m4a"
   fi
-}
-
-# Function to process a directory
-process_directory() {
-  local dir="$1"
-  # echo "Entering directory: $dir"
-  # pushd "$dir" || return
-  # ls * |xargs -n 1 -- ${(%):-%x} process_file
-  ls "$dir/*" | xargs -n 1 -- ${0} process_file
-
-  # echo "Exiting directory: $dir"
-  # popd >/dev/null
 }
 
 # processes a file (if supported audio) and builds the valid_files array
@@ -308,6 +296,7 @@ process_audiobook() {
     if [[ -d "$arg" ]]; then
       local dir="$arg"
       output_dir="$dir"
+      pushd "$dir"
 
       # Find all files in the directory and send to process_file in sorted order
       # -z: This option tells sort to use null characters (\0) as delimiters.
@@ -316,8 +305,10 @@ process_audiobook() {
       # find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
       #   process_file "$file"
       # done
-      process_directory "$arg" # HACK: attempt at a recursion
-      # process_argument "${dir}"/* # HACK: only sends the first file to process_file
+      for f in *.mp3; do
+        process_file "$f"
+      done
+      popd
 
     elif [[ -f "$arg" ]]; then
       process_file "$arg"
@@ -513,4 +504,4 @@ verify_merged_file() {
 # done
 
 process_audiobook "$@"
-# "${@:-process_audiobook}"
+# "${@:-process_audiobook $@}"
