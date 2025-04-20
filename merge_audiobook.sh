@@ -9,7 +9,7 @@ if [ $# -lt 1 ]; then
 fi
 
 # # Create safe temporary directory
-tmpdir=$(mktemp -d -t audiomerge-XXXXXXXXXX)
+tmpdir=$(mktemp -d -t audiomerge)
 # converted_pipe="$tmpdir/converted_file"
 # mkfifo "$converted_pipe"
 # output_dir=$(dirname "$1")
@@ -26,11 +26,17 @@ error() {
 # Set conditional trap
 trap '[[ $cleanup_needed == "true" ]] && { ok "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
 
+# optimized conversion for any audio type
 convert_to_m4b() {
   local input_file="${1}"
-  # local output_file="${2:-${input_file%.*}.m4a}"
   # If not given, construct output filename in tempdir (replace .mp3 with .m4b)
-  local output_file="${2:-${tmpdir}/${input_file%.*}.m4b}"
+  # local output_file="${2:-${tmpdir}/${input_file%.*}.m4b}"
+
+  local caff_file="${2:-${input_file%.*}.caf}"
+  local m4b_file="${2:-${input_file%.*}.m4b}"
+  # mkfifo audio_pipe.caf
+  # trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
+
   local afconvert_path=$(which afconvert)
 
   # # Check if afconvert is installed
@@ -38,53 +44,15 @@ convert_to_m4b() {
     error "afconvert is not installed.  This script requires macOS." >&2
     return 1 # Indicate failure
   fi
+  audio_to_caf "$input_file" "$tmpdir"/"$caff_file"
+  output_file=$(caf_to_m4b "$tmpdir"/"$caff_file" "$tmpdir"/"$m4b_file")
 
-  # Get audio metadata using afinfo
-  local metadata=$(afinfo "$input_file" | grep -E 'sample rate|bit rate')
-  local sample_rate=$(echo "$metadata" | grep 'sample rate' | awk '{print $3}')
-  local bit_rate=$(echo "$metadata" | grep 'bit rate' | awk '{print $3}' | sed 's/\..*//')
-
-  # Determine codec based on specifications
-  local codec="aac" # Default to AAC-LC
-  local strategy=2  # VBR constrained
-  local quality=127 # Highest quality
-  local bitrate_flag=""
-
-  # if (( $(echo "$sample_rate <= 24000" | bc -l) )); then
-  #   codec="aach" # HE-AAC v2 (PS+SBR)
-  # elif (( $(echo "$sample_rate <= 32000" | bc -l) )); then
-  #   codec="aach" # HE-AAC v1 (SBR only)
-  # fi
-
-  if ((bit_rate >= 64000)) && [[ "$codec" == "aac" ]]; then
-    # Use AAC-LC with VBR for higher bitrates
-    strategy="3" # Full VBR mode
-    # bitrate_flag="-ue $quality"
-  elif ((bit_rate < 64000)) && [[ "$codec" == "aac" ]]; then
-    # Force HE codecs for low bitrates even if sample rate is high
-    codec="aach"
-  fi
-
-  # Construct afconvert command
-  local cmd=(
-    "${afconvert_path}" -f m4bf -d "$codec"
-    -s "$strategy"
-    -q "$quality"
-    --soundcheck-generate
-    --media-kind "Audiobook"
-    "${input_file}" "${output_file}"
-  )
-  # "$bitrate_flag"
-
-  # echo "Converting with: ${cmd[*]}"
-  "${cmd[@]}"
   echo "${output_file}"
 }
 
 audio_to_caf() {
   # NOTE: experiment to try and take any audio and pass through highest quality
   local input_file=${1}
-  # local output_file="${2:-${tmpdir}/${input_mp3%.mp3}.caf}"
   local output_file="${2:-${input_file%.*}.caf}"
   # Converts MP3 → CAF (Apple's core audio format)
   # Generates loudness metadata (--soundcheck-generate + --anchor-generate)
@@ -93,7 +61,7 @@ audio_to_caf() {
     --soundcheck-generate \
     --anchor-generate
 
-  echo "${output_file}"
+  # echo "${output_file}"
 }
 
 caf_to_m4b() {
@@ -101,36 +69,43 @@ caf_to_m4b() {
   local output_file="${2:-${input_file%.caf}.m4b}"
   afconvert -f m4bf -d aac -q 127 -s 3 \
     --soundcheck-read \
+    --media-kind "Audiobook" \
     "${input_file}" -o "${output_file}"
 
   echo "${output_file}"
 }
 
+# WARN: Still can't get named pipes to work with afconvert
 audio_caf_m4b_pipeline() {
   # NOTE: named pipe experiment to reduce extra flle writing
-  local input_files="${1}"
-  mkfifo audio_pipe.caf
-  trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
+  local input_file="${1}"
+  local caff_file="${2:-${input_file%.*}.caf}"
+  local m4b_file="${2:-${input_file%.*}.m4b}"
+  # mkfifo audio_pipe.caf
+  # trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
+
+  audio_to_caf "$input_file" "$tmpdir"/"$caff_file"
+  caf_to_m4b "$tmpdir"/"$caff_file" "$tmpdir"/"$m4b_file"
 
   # WARN: soundcheck information is sent after file in named pipe so fails
   #
-  # Start read pipe for convert in background
-  while IFS= read -r file; do
-    afconvert <(echo "$file") -f m4bf -d aac -q 127 -s 3 &
-  done &
-
-  while true; do
-    afconvert caff.pipe -f m4bf -d aac -q 127 -s 3 &
-  done &
+  # # Start read pipe for convert in background
+  # while IFS= read -r file; do
+  #   afconvert <(echo "$file") -f m4bf -d aac -q 127 -s 3 &
+  # done &
+  #
+  # while true; do
+  #   afconvert caff.pipe -f m4bf -d aac -q 127 -s 3 &
+  # done &
 
   # --soundcheck-read \
 
-  # Convert and feed to pipe
-  for file in $input_files; do
-    afconvert "$file" audio_pipe.caf -d 0 -f caff
-    # --soundcheck-generate \
-    # --anchor-generate
-  done
+  # # Convert and feed to pipe
+  # for file in $input_files; do
+  #   afconvert "$file" audio_pipe.caf -d 0 -f caff
+  #   # --soundcheck-generate \
+  #   # --anchor-generate
+  # done
 }
 
 # PERF: fairly well organized
@@ -210,13 +185,14 @@ process_file() {
     echo "Converting MP3: $file to M4B:"
     # converted_file=$(convert_mp3_to_m4b "$file")
     converted_file=$(convert_to_m4b "$file")
+    # converted_file=$(audio_caf_m4b_pipeline "$file")
     # read -r converted_file <converted_pipe
-    # echo "Adding M4A file: $converted_file to aac_file" # Replace with actual processing
     aac_file="$converted_file"
   else
     warn "Skipping file: $file (unsupported type)"
   fi
 
+  # WARN: Need to move metadata processing to before any conversions to make sure it is captured
   # Extract metadata from file
   meta_file="$tmpdir/${file}.json"
 
@@ -226,7 +202,7 @@ process_file() {
 
   valid_files+=("$aac_file")
   absolute_path=$(realpath "$aac_file")
-  generate_ffmpeg_file_list >>"$file_list"
+  generate_ffmpeg_file_list >>"$file_list" # WARN: converted files seem to present absolute_path as chapter titles
   warn "Valid file count: ${#valid_files[*]}"
 
   # Get original file duration in seconds (floating-point) for precision in file comparison
@@ -498,10 +474,5 @@ verify_merged_file() {
   fi
 }
 
-# for input in "$@"; do
-#   # process_argument "$input"
-#   process_audiobook "$input"
-# done
-
-process_audiobook "$@"
-# "${@:-process_audiobook $@}"
+# process_audiobook "$@"
+"${@:-process_audiobook $@}"
