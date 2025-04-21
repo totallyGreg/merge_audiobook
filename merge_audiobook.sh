@@ -10,6 +10,25 @@ fi
 
 # # Create safe temporary directory
 tmpdir=$(mktemp -d -t audiomerge)
+
+# Create
+ramdisk_setup() {
+  set -x
+  ram_size=$((1024 * 2048)) # 1GB
+  ramdisk=$(hdiutil attach -nomount ram://$ram_size)
+  diskutil erasevolume APFSI "AudioRAM" "${ramdisk#/dev/}"
+  tmpdir=$(mktemp -d -p "/Volumes/AudioRAM" -t audiomerge)
+  echo "Created /Volumes/AudioRAM"
+}
+
+# Remove
+ramdisk_clean() {
+  diskutil unmount /Volumes/AudioRAM
+  # hdiutil detach "$(diskutil list | awk '/AudioRAM/ {print $NF}')" -force
+  hdiutil eject ${ramdisk#/dev/}
+  unset ramdisk
+}
+
 # converted_pipe="$tmpdir/converted_file"
 # mkfifo "$converted_pipe"
 # output_dir=$(dirname "$1")
@@ -24,7 +43,7 @@ error() {
 }
 
 # Set conditional trap
-trap '[[ $cleanup_needed == "true" ]] && { ok "Cleaning up"; rm -rf "$tmpdir"; }' EXIT INT TERM
+trap '[[ $cleanup_needed == "true" ]] && { ok "Cleaning up"; rm -rf "$tmpdir"; } || { ok "Cleaning up"; ramdisk_clean; }' EXIT INT TERM
 
 # optimized conversion for any audio type
 convert_to_m4b() {
@@ -292,9 +311,13 @@ process_audiobook() {
       # find "$dir" -type f -print0 | sort -z | while IFS= read -r -d $'\0' file; do
       #   process_file "$file"
       # done
-      for f in *.mp3; do
+      # shopt -s nocaseglob # Prevent unmatched globs from being treated as literal
+      for f in *.mp3 *.m4a *.m4b; do
+        [ -e "$f" ] || continue # Skip if no files exist (redundant with nullglob but adds safety)
         process_file "$f"
       done
+      # shopt -u nullglob # Optional: Restore default behavior
+
       popd
 
     elif [[ -f "$arg" ]]; then
