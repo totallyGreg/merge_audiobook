@@ -6,10 +6,24 @@ GREEN=$(tput setaf 2)
 YELLOW=$(tput setaf 3)
 NC=$(tput sgr0)
 
-ok() { echo -e "${GREEN}$1${NC}"; }
-warn() { echo -e "${YELLOW}$1${NC}"; }
+# ok() { printf '%s\n' "${GREEN}$1${NC}"; }
+ok() {
+  if [[ "${2:-}" == "-n" ]]; then
+    printf '%s' "${GREEN}$1${NC}"
+  else
+    printf '%s\n' "${GREEN}$1${NC}"
+  fi
+}
+# warn() { printf '%s' "${YELLOW}$1${NC}"; }
+warn() {
+  if [[ "${2:-}" == "-n" ]]; then
+    printf '%s' "${YELLOW}$1${NC}"
+  else
+    printf '%s\n' "${YELLOW}$1${NC}"
+  fi
+}
 error() {
-  echo -e "${RED}ERROR: $1${NC}"
+  printf '%s\n' "${RED}ERROR: $1${NC}"
   logger "$1"
 }
 
@@ -24,6 +38,7 @@ setup_temp() {
   # # Create safe temporary directory
   tmpdir=$(mktemp -d -t audiomerge-"$artist")
 
+  # NOTE:
   # Create
   ramdisk_setup() {
     set -x
@@ -57,11 +72,8 @@ trap '[[ $cleanup_needed == "true" ]] && { ok "Cleaning up"; rm -rf "$tmpdir"; }
 # optimized conversion for any audio type
 convert_to_m4b() {
   local input_file="${1}"
-  # If not given, construct output filename in tempdir (replace .mp3 with .m4b)
-  # local output_file="${2:-${tmpdir}/${input_file%.*}.m4b}"
-
-  local caff_file="${2:-${input_file%.*}.caf}"
-  local m4b_file="${2:-${input_file%.*}.m4b}"
+  local caff_file="${2:-$tmpdir/${input_file%.*}.caf}"
+  local m4b_file="${2:-$tmpdir/${input_file%.*}.m4b}"
   # mkfifo audio_pipe.caf
   # trap 'echo "Cleaning up"; rm audio_pipe.caf' EXIT TERM
 
@@ -72,8 +84,8 @@ convert_to_m4b() {
     error "afconvert is not installed.  This script requires macOS." >&2
     return 1 # Indicate failure
   fi
-  audio_to_caf "$input_file" "$tmpdir"/"$caff_file"
-  output_file=$(caf_to_m4b "$tmpdir"/"$caff_file" "$tmpdir"/"$m4b_file")
+  audio_to_caf "$input_file"
+  output_file=$(caf_to_m4b "$caff_file")
 
   echo "${output_file}"
 }
@@ -81,7 +93,7 @@ convert_to_m4b() {
 audio_to_caf() {
   # NOTE: experiment to try and take any audio and pass through highest quality
   local input_file=${1}
-  local output_file="${2:-${input_file%.*}.caf}"
+  local output_file="${2:-$tmpdir/${input_file%.*}.caf}"
   local afconvert_args=()
 
   # NOTE:
@@ -122,8 +134,13 @@ caf_to_m4b() {
   )
   # --copy-hash # NOTE: no point until generate-hash works
 
-  afconvert "${afconvert_args[@]}"
-  echo "${output_file}"
+  if afconvert "${afconvert_args[@]}"; then
+    echo "${output_file}"
+  else
+    cleanup_needed=false
+    open "$tmpdir"
+    exit 1
+  fi
 }
 
 # WARN: Still can't get named pipes to work with afconvert
@@ -159,40 +176,93 @@ audio_caf_m4b_pipeline() {
   # done
 }
 
-# PERF: fairly well organized
-# TODO: this should be called recursively but MUST be sorted first
-generate_chapter_info() {
-  local meta_file="$1"
+extract_chapter_data() {
+  # NOTE: expects ffprobe json metadata and an real number offset
+  # meta_data=$(ffprobe -v quiet -i "$input_file" -show_chapters -show_format -of json)
+  local meta_data="$1"
   local real_offset="$2"
 
-  # Single JSON parse with type conversion
-  local chapter_data
-  chapter_data=$(jq -r --argjson offset "$real_offset" '
+  # NOTE: Need to better handle the time_base
+  # 1. Parse the time_base string to get numerator and denominator.
+  # 2. Convert .start and .end raw timestamps to seconds by multiplying with time_base.
+  # 3. Convert seconds to milliseconds (integer).
+  # 4. Add your offset (also in ms).
+
+  # (.format.filename // "Untitled" | sub("\\.[^.]+$"; "")) as $filename_base |
+  jq -r --argjson real_offset "$real_offset" '
+    def timebase_factor:
+    (.time_base | split("/") | map(tonumber)) as $tb | ($tb[0] / $tb[1]);
+
+    def parse_timebase:
+      if has("time_base") and (.time_base | test("^\\d+/\\d+$")) then
+        (.time_base | split("/") | map(tonumber)) as $tb |
+        ($tb[0] / $tb[1])
+      else
+        1.0
+      end;
+
     def sec2ms: (. | tonumber) * 1000 | floor;
+ 
+    ($real_offset * 1000 | floor) as $offset |  # Convert input to ms integer
 
     (.chapters | length > 0) as $has_chapters |
-    (.format.filename // "Untitled" | sub("\\.[^.]+$"; "")) as $filename_base |
+    (.format.filename // "Untitled" | split("/") | .[-1] | sub("\\.[^.]+$"; "")) as $filename_base |
     (.format.duration? // "0" | sec2ms) as $duration_ms |
     (.format.start_time? // "0" | sec2ms) as $start_time_ms |
 
     if $has_chapters then
-      .chapters[] |
-      "[CHAPTER]\n" +
-      "TIMEBASE=1/1000\n" +
-      "START=\((.start | tonumber | sec2ms) + $offset)\n" +
-      "END=\((.end | tonumber | sec2ms) + $offset)\n" +
-      "title=\(.tags.title // $filename_base)\n"
+      .chapters[] | {
+        start: ((((.start | tonumber) * parse_timebase) * 1000 | floor) + $offset),
+        end: ((((.end | tonumber) * parse_timebase) *1000 | floor) + $offset),
+        title: (.tags.title // $filename_base)
+      }
     else
-      "[CHAPTER]\n" +
-      "TIMEBASE=1/1000\n" +
-      "START=\($start_time_ms + $offset)\n" +
-      "END=\($start_time_ms + $offset + $duration_ms)\n" +
-      "title=\($filename_base)\n"
+      {
+        start: $offset,
+        end: ($offset + $duration_ms),
+        title: (.tags.title // $filename_base)
+      }
     end
-  ' <<<"$meta_file")
-  # ' "$meta_file")  # NOTE: removed when I switched to storing json in variable
+  ' <<<"$meta_data"
+}
 
-  printf "%s\n" "$chapter_data"
+format_ffmetadata() {
+  local chapter_data="$1"
+
+  # Debug output
+  jq . <<<"$chapter_data" >&2
+
+  #   if type == "array" then
+  #     jq -r '
+  #     .[] | "[CHAPTER]\nTIMEBASE=1/1000\nSTART=\(.start)\nEND=\(.end)\ntitle=\(.title)\n"
+  #   else
+  #     "[CHAPTER]\nTIMEBASE=1/1000\nSTART=\(.start)\nEND=\(.end)\ntitle=\(.title)\n"
+  #   end
+  # ' <<<"$chapter_data"
+
+  jq -r '
+    "[CHAPTER]\nTIMEBASE=1/1000\n" +
+    "START=\(.start | floor)\n" +
+    "END=\(.end | floor)\n" +
+    "title=\(.title)\n"
+  ' <<<"$chapter_data"
+}
+
+generate_chapter_info() {
+  local meta_file="$1"
+  local real_offset="$2"
+
+  # if ! [[ -f "$meta_file" ]]; then
+  #   echo "Error: Metadata file not found" >&2
+  #   return 1
+  # fi
+
+  # if ! chapter_data=$(extract_chapter_data "$meta_file" "$real_offset"); then
+  #   echo "Error: Invalid JSON structure" >&2
+  #   return 1
+  # fi
+  chapter_data=$(extract_chapter_data "$meta_file" "$real_offset")
+  format_ffmetadata "$chapter_data" || return 1
 }
 
 extract_cover_art() {
@@ -215,28 +285,17 @@ add_cover_art() {
   fi
 }
 
+# get meta_data from input file and set variables
 gather_file_info() {
   local input_file="$1"
-  # local ffmetadata="$tmpdir/${file}.json"
-  # ffmetadata=$(ffprobe -v quiet -i "$input_file" -show_chapters -show_format -of json)
-  # ffprobe -v quiet -i "$input_file" -show_chapters -show_format -of json >"$ffmetadata"
 
-  # # NOTE: This works but creates extra files
-  # meta_file="$tmpdir/${file}.json"
-  # ffprobe -v quiet -i "$file" -show_chapters -show_format -of json >"$meta_file"
-  # [[ -z $artist ]] && artist=$(jq -r '.format.tags.artist' "$meta_file")
-  # [[ -z $album ]] && album=$(jq -r '.format.tags.album' "$meta_file")
-  # [[ -z $year ]] && year=$(jq -r '.format.tags.date' "$meta_file")
-  # file_duration=$(jq -r '.format.duration' "$meta_file")
-
-  # HACK: trying to save data to variable instead of to file
   meta_data=$(ffprobe -v quiet -i "$input_file" -show_chapters -show_format -of json)
   [[ -z ${artist} ]] && artist=$(jq -r '.format.tags.artist' <<<"$meta_data")
   [[ -z ${album} ]] && album=$(jq -r '.format.tags.album' <<<"$meta_data")
   [[ -z ${year} ]] && year=$(jq -r '.format.tags.date' <<<"$meta_data")
+  # [[ -z ${title} ]] && title=$(jq -r '.chapters.tags.title' <<<"$meta_data")
 
   real_file_duration_secs=$(jq -r '.format.duration' <<<"$meta_data")
-  # cat "$ffmetadata"
 }
 
 # processes a file (if supported audio) and builds the valid_files array
@@ -246,10 +305,8 @@ process_file() {
   local aac_file
   local meta_data
 
-  # echo -en "Processing $file...\t"
-  printf '%s\t' "Processing ${file}.."
+  ok "Processing file: ${file}.."
   start_timestamp=$(date +%s)
-  # meta_file="$tmpdir/${file}.json"
   mime_type=$(file -b --mime-type "$file")
   if [[ "$mime_type" =~ $AUDIO_M4A ]] || [[ "$file" =~ $FILE_M4A ]] || [[ "$file" =~ $FILE_M4B ]]; then
     # NOTE: just pass m4a/b files on through
@@ -260,8 +317,9 @@ process_file() {
     # setup_temp
     local converted_file
     gather_file_info "$file"
-    printf '%5s\t' "->m4b"
+    printf '%-6s' "${YELLOW}->m4b ${NC}"
     converted_file=$(convert_to_m4b "$file")
+    gather_file_info "$converted_file"
     aac_file="$converted_file"
   else
     warn "Skipping file: $file (unsupported type)"
@@ -270,31 +328,31 @@ process_file() {
   # NOTE: for each valid aac file to merge, generate the ffmpeg file line
   generate_ffmpeg_concat_line "$aac_file"
 
-  # HACK: moved to gather_file_info
-  # Get original file duration in seconds (floating-point) for precision in file comparison
-  # file_duration=$(jq -r '.format.duration' "$meta_file")
-
   # NOTE: then generate any chapter information
   # generate expects a real number for cumulative_offset and will do the rounding in jq
+
+  # chapter_data=$(extract_chapter_data "$meta_file" "$real_offset")
+  # format_ffmetadata "$chapter_data" || return 1
+  # title="$(jq '.chapter.tags.title' <<<"$meta_data")"
+  # printf '%s %s' "Processing Chapter:" "$title"
   generate_chapter_info "$meta_data" "$cumulative_offset" >>"$chapters_file"
 
   # For integer milliseconds (rounded):
   rounded_ms=$(sec2msInt $real_file_duration_secs)
-  # ok "$(basename "$aac_file")\t start: $cumulative_offset\t real: $real_file_duration_secs\t rounded: $rounded_ms"
-  # printf '%-15s %-20s %-20s %-15s\n' "$(basename "$aac_file")" "start: $cumulative_offset" "real: $real_file_duration_secs" "rounded: $rounded_ms"
-  printf '%-20s %-20s %-15s\n' "start: $cumulative_offset" "real: $real_file_duration_secs" "rounded: $rounded_ms"
+
+  # printf '%s %15.8f %s %13.8f %s %08d ' "start:" "$cumulative_offset" "real:" "$real_file_duration_secs" "rounded:" "$rounded_ms"
+  # file_stat=$(printf '%s %13.8f %s %13.8f %s %08d ' "start:" "$cumulative_offset" "real:" "$real_file_duration_secs" "rounded:" "$rounded_ms")
+  # ok "Length of line is: ${#file_stat}"
 
   # NOTE: and finally increment offset and storage arrays
-  # result=$( echo $num1+$num2 | bc )
-  # cumulative_offset=$((cumulative_offset + real_file_duration_secs)) # NOTE: set each file offset to running total of duration_ms as integer.
   cumulative_offset=$(echo $cumulative_offset + $real_file_duration_secs | bc)
   valid_files+=("$aac_file")
   durations+=("$real_file_duration_secs") # NOTE: Store total file durations in seconds with full precision and compare later as milliseconds
   meta_files+=("$meta_data")              # NOTE: Store meta data file location in array
 
-  # end_timestamp=$(date +%s)
-  # elapsed_time=$(expr $end_timestamp - $start_timestamp) # WARN: this seems to stop processing of the function
-  # echo "Elapsed: $elapsed_time seconds"
+  end_timestamp=$(date +%s)
+  elapsed_time=$(echo $end_timestamp - $start_timestamp | bc)
+  warn "Processing Time Elapsed: $elapsed_time seconds" # NOTE: nice to gather and create report.
 }
 
 # Process list of input files into an audiobook
@@ -319,6 +377,7 @@ process_audiobook() {
   artist=""
   year=""
   cumulative_offset=0
+  merged_audio_file=""
 
   # NOTE: really only needs to be setup if doing a transcode
   # but ffmetadata is currently stored there too
@@ -343,7 +402,7 @@ process_audiobook() {
   # and the FFMETADATA1 with tags, chapters and duration
   local arg="$@"
 
-  warn "Argument: $arg received"
+  printf '%s\n' "${YELLOW}Argument: $arg received${NC}"
   for arg; do
     if [[ -d "$arg" ]]; then
       local dir="$arg"
@@ -439,9 +498,11 @@ generate_ffmetadata() {
 merge_m4a_files() {
   # requires file merge list created by `generate_ffmpeg_file_merge_list`
   # and required tags and chapters created with generate_ffmetadata
+  merged_audio_file="$tmpdir/merged.m4a"
   generate_ffmetadata
 
-  local sum_seconds=$(
+  local sum_seconds
+  sum_seconds=$(
     IFS=+
     echo "scale=6; ${durations[*]}" | bc
   )
@@ -449,10 +510,11 @@ merge_m4a_files() {
   # NOTE: `-movflags use_metadata_tags` doesn't seem to actually keep the global metadata
   # NOTE: testing composing the ffmpeg command in a function
 
-  echo "==========================================="
-  printf '\t\t\t%-20s %-20s\n' "Offset: $cumulative_offset" "Real: $sum_seconds"
+  ok "==========================================="
+  # Processing <filename > | ->m4b |
+  printf '\t\t\t%60s %-20s\n' "Offset: $cumulative_offset" "Real: $sum_seconds"
 
-  echo "Merging $(cat $file_merge_list | wc -l) files..."
+  warn "Merging $(cat $file_merge_list | wc -l) files..."
   # Use an array to store command components
   local ffmpeg_args=()
 
@@ -473,7 +535,7 @@ merge_m4a_files() {
     -map 0:a
     -movflags use_metadata_tags
     -c copy
-    "$(printf "%q" "$tmpdir/merged.m4a")" # Escape output path
+    "$(printf "%q" "$merged_audio_file")" # Escape output path
   )
 
   # for cover in "${cover_images[@]}"; do
